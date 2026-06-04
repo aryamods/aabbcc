@@ -14,7 +14,11 @@ from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 import matplotlib.pyplot as plt
-from json_repair import repair_json  # pip install json-repair
+from json_repair import repair_json
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Suppress oneDNN warnings
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -24,21 +28,83 @@ app = FastAPI()
 # Setup logging ke terminal
 logging.basicConfig(level=logging.INFO)
 
-# Konfigurasi Gemini API (ganti dengan key asli Anda jika perlu)
-GEMINI_API_KEY = "...dkKNe7.....xqEBVs..."  # ← ganti dengan API key kamu
+# Konfigurasi Gemini API dari environment variable
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+if not GEMINI_API_KEY:
+    logging.warning("GEMINI_API_KEY not set! AI recommendations will use fallback.")
+
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-# Load model klasifikasi kulit dan label
-model = tf.keras.models.load_model("skin_model.h5")
-labels = ["Acne", "Dry", "Normal", "Oily"]
+# Fungsi untuk download model dari Google Drive (untuk Railway deployment)
+def ensure_model_downloaded():
+    """Download model from Google Drive if not exists (for Railway deployment)"""
+    if os.path.exists("skin_model.h5"):
+        logging.info("✅ Model already exists, skipping download")
+        return True
+    
+    logging.info("📥 Model not found, downloading from Google Drive...")
+    
+    # Ganti dengan FILE ID Google Drive Anda
+    # Cara dapatkan FILE ID: dari URL share Google Drive
+    # Contoh: https://drive.google.com/file/d/1ABC123xyz/view -> FILE ID = 1ABC123xyz
+    FILE_ID = os.getenv("MODEL_FILE_ID", "YOUR_GOOGLE_DRIVE_FILE_ID_HERE")
+    
+    if FILE_ID == "YOUR_GOOGLE_DRIVE_FILE_ID_HERE":
+        logging.error("❌ MODEL_FILE_ID not set in environment variables!")
+        logging.error("Please set MODEL_FILE_ID in Railway Variables")
+        return False
+    
+    try:
+        import gdown
+        url = f"https://drive.google.com/uc?id={FILE_ID}"
+        gdown.download(url, "skin_model.h5", quiet=False)
+        
+        if os.path.exists("skin_model.h5"):
+            size = os.path.getsize("skin_model.h5") / (1024 * 1024)
+            logging.info(f"✅ Model downloaded successfully! Size: {size:.2f} MB")
+            return True
+        else:
+            logging.error("❌ Download failed - file not found")
+            return False
+    except ImportError:
+        logging.error("❌ gdown not installed! Please add gdown to requirements.txt")
+        return False
+    except Exception as e:
+        logging.error(f"❌ Download error: {e}")
+        return False
+
+# Download model jika diperlukan (untuk Railway)
+# Untuk local development, pastikan file skin_model.h5 sudah ada
+if not os.path.exists("skin_model.h5"):
+    success = ensure_model_downloaded()
+    if not success:
+        logging.warning("⚠️ Could not download model, using mock model for testing")
+        # Create mock model for testing if download fails
+        class MockModel:
+            def predict(self, x, verbose=0):
+                return np.random.dirichlet(np.ones(4), size=1)
+        model = MockModel()
+        labels = ["Acne", "Dry", "Normal", "Oily"]
+    else:
+        # Load model klasifikasi kulit dan label
+        model = tf.keras.models.load_model("skin_model.h5")
+        labels = ["Acne", "Dry", "Normal", "Oily"]
+else:
+    # Load model klasifikasi kulit dan label
+    model = tf.keras.models.load_model("skin_model.h5")
+    labels = ["Acne", "Dry", "Normal", "Oily"]
 
 # Load face detector dari MediaPipe
-face_detector = mp.tasks.vision.FaceDetector.create_from_options(
-    mp.tasks.vision.FaceDetectorOptions(
-        base_options=mp.tasks.BaseOptions(model_asset_path="face_detection_short_range.tflite"),
-        min_detection_confidence=0.75
+try:
+    face_detector = mp.tasks.vision.FaceDetector.create_from_options(
+        mp.tasks.vision.FaceDetectorOptions(
+            base_options=mp.tasks.BaseOptions(model_asset_path="face_detection_short_range.tflite"),
+            min_detection_confidence=0.75
+        )
     )
-)
+except Exception as e:
+    logging.error(f"Failed to load face detector: {e}")
+    face_detector = None
 
 # ---------- Helper functions ----------
 def get_static_recommendation(skin_type):
@@ -72,6 +138,10 @@ def process_frame(frame_bytes):
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    
+    if face_detector is None:
+        return None
+        
     results = face_detector.detect(mp_image)
 
     h, w, _ = frame.shape
@@ -192,7 +262,6 @@ async def get_index():
         .close, .close-chart { float: right; font-size: 1.8rem; cursor: pointer; }
         @media (max-width: 1100px) { .sidebar { width: 100%; flex-direction: row; flex-wrap: wrap; } .right-panel { width: 100%; } }
 
-        /* ===== DARK MODE: semua teks berubah putih/terang ===== */
         body.dark { color: #f0f0f0; }
         body.dark .sidebar { color: #f0f0f0; }
         body.dark .right-panel { color: #f0f0f0; background: rgba(30,30,40,0.85); }
@@ -305,13 +374,12 @@ async def get_index():
 
     let stream = null, ws = null, cameraActive = false, paused = false, animationId = null, currentResult = null, historyList = [];
     let lastSendTime = 0;
-    const SEND_INTERVAL = 100; // kirim lebih sering = deteksi lebih responsif
+    const SEND_INTERVAL = 100;
 
-    // Box tracking — pisah antara target (dari server) dan displayed (smooth)
-    let lastBox = null;       // metadata warna/label
-    let targetBox = null;     // koordinat terakhir dari server (piksel canvas)
-    let smoothBox = null;     // koordinat yang ditampilkan (di-lerp tiap frame)
-    let offscreenCanvas = null; // canvas khusus untuk kirim ke server (tanpa box overlay)
+    let lastBox = null;
+    let targetBox = null;
+    let smoothBox = null;
+    let offscreenCanvas = null;
 
     function getStaticRecommendation(skinType) {
         if (skinType === "Acne") return { rec: "• Salicylic Acid 2%\\n• Niacinamide Serum\\n• Gentle Cleanser\\n• Oil-Free Moisturizer\\n• Sunscreen SPF 50", routine: "☀️ Pagi: Gentle cleanser → Niacinamide → Moisturizer → SPF\\n🌙 Malam: Cleanse → Salicylic acid → Moisturizer" };
@@ -322,12 +390,11 @@ async def get_index():
 
     let lastAICallTime = 0;
     let lastAISkinType = null;
-    const AI_COOLDOWN_MS = 8000; // 8 detik cooldown agar tidak spam API
+    const AI_COOLDOWN_MS = 8000;
 
     async function upgradeRecommendationWithAI(result) {
         if (!result) return;
         const now = Date.now();
-        // Lewati jika masih dalam cooldown DAN skin_type sama
         if (now - lastAICallTime < AI_COOLDOWN_MS && lastAISkinType === result.skin_type) return;
         lastAICallTime = now;
         lastAISkinType = result.skin_type;
@@ -374,14 +441,11 @@ async def get_index():
         acneBar.value = result.acne; acneVal.innerText = result.acne+"%";
         blackspotBar.value = result.blackspot; blackspotVal.innerText = result.blackspot+"%";
         wrinkleBar.value = result.wrinkle; wrinkleVal.innerText = result.wrinkle+"%";
-        // Tampilkan rekomendasi statis dulu sebagai fallback instan
         const { rec, routine } = getStaticRecommendation(result.skin_type);
-        // Hanya ganti teks jika belum ada hasil AI atau skin_type berubah
         if (lastAISkinType !== result.skin_type) {
             recommendationDiv.innerText = rec;
             routineDiv.innerText = routine;
         }
-        // Panggil AI hanya jika cooldown sudah habis
         const now = Date.now();
         if (now - lastAICallTime >= AI_COOLDOWN_MS || lastAISkinType !== result.skin_type) {
             upgradeRecommendationWithAI(result);
@@ -390,7 +454,6 @@ async def get_index():
         if (historyList.length===0 || historyList[historyList.length-1]!==entry) { historyList.push(entry); if(historyList.length>50) historyList.shift(); }
     }
 
-    // Dipakai untuk mode upload foto (static, bukan live)
     function drawBoundingBox(box, color, label, imageWidth, imageHeight) {
         const srcW = imageWidth  || canvas.width;
         const srcH = imageHeight || canvas.height;
@@ -409,39 +472,29 @@ async def get_index():
         ctx.fillText(label, sx1 + 4, sy1 - 5);
     }
 
-
     function handleWebSocketMessage(event) {
         const res = JSON.parse(event.data);
         if (res.error) { detectInfo.innerText = "⚠️ No face detected"; return; }
         detectInfo.innerText = "✅ Skin analyzed!";
         updateUI(res);
-        // Konversi koordinat box ke piksel canvas sekarang, simpan sebagai target
         if (res.box) {
             const [x1,y1,x2,y2] = res.box;
-            // box dari server sudah dalam ruang canvas (offscreen = resolusi sama)
             targetBox = { x1, y1, x2, y2 };
             lastBox = { color: res.box_color, label: `${res.skin_type} (${res.confidence}%)` };
-            // Inisialisasi smoothBox ke target jika belum ada (frame pertama)
             if (!smoothBox) smoothBox = { ...targetBox };
         } else {
-            // Wajah tidak terdeteksi — fade out box
             targetBox = null;
         }
     }
 
-    // Lerp helper — gerakkan nilai a menuju b dengan faktor t
     function lerp(a, b, t) { return a + (b - a) * t; }
 
-    // Render loop: 60fps — gambar video bersih lalu overlay box yang di-smooth
     function renderLoop() {
         if (!cameraActive) return;
         if (video.videoWidth) {
-            // Gambar frame video bersih (tanpa box) ke canvas tampil
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-            // Smooth box: gerakkan smoothBox mendekati targetBox tiap frame
             if (targetBox && lastBox) {
-                const t = 0.35; // faktor lerp: 0=tidak gerak, 1=langsung snap
+                const t = 0.35;
                 if (!smoothBox) smoothBox = { ...targetBox };
                 smoothBox.x1 = lerp(smoothBox.x1, targetBox.x1, t);
                 smoothBox.y1 = lerp(smoothBox.y1, targetBox.y1, t);
@@ -449,14 +502,12 @@ async def get_index():
                 smoothBox.y2 = lerp(smoothBox.y2, targetBox.y2, t);
                 drawSmoothBox(smoothBox, lastBox.color, lastBox.label);
             } else if (!targetBox) {
-                // Wajah hilang — reset smooth box
                 smoothBox = null;
             }
         }
         animationId = requestAnimationFrame(renderLoop);
     }
 
-    // Gambar box dari koordinat smooth (sudah dalam piksel canvas, scale 1:1)
     function drawSmoothBox(sb, color, label) {
         const x = sb.x1, y = sb.y1, w = sb.x2 - sb.x1, h = sb.y2 - sb.y1;
         ctx.strokeStyle = color;
@@ -470,15 +521,12 @@ async def get_index():
         ctx.fillText(label, x + 4, y - 5);
     }
 
-    // Send loop: kirim frame BERSIH (dari video langsung) ke server
-    // Menggunakan offscreenCanvas — server tidak melihat box overlay
     async function sendFrameToServer() {
         if (!cameraActive || !stream) return;
         if (!paused && ws && ws.readyState === WebSocket.OPEN && video.videoWidth) {
             const now = Date.now();
             if (now - lastSendTime >= SEND_INTERVAL) {
                 lastSendTime = now;
-                // Gambar video langsung ke offscreen canvas — tanpa box overlay
                 offscreenCanvas.width  = canvas.width;
                 offscreenCanvas.height = canvas.height;
                 offscreenCanvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -496,10 +544,8 @@ async def get_index():
             video.srcObject = stream;
             await video.play();
 
-            // Sinkronkan canvas ke resolusi asli video agar koordinat box 1:1
             canvas.width  = video.videoWidth  || 860;
             canvas.height = video.videoHeight || 620;
-            // Init offscreen canvas untuk kirim bersih ke server
             offscreenCanvas = document.createElement('canvas');
             offscreenCanvas.width  = canvas.width;
             offscreenCanvas.height = canvas.height;
@@ -508,14 +554,16 @@ async def get_index():
             cameraStatus.innerText = "🟢 Live";
             btnPause.innerText = "⏸ Pause";
             placeholder.style.display = "none";
-            video.style.display = "none";   // disembunyikan, canvas yang tampil sebagai mirror
+            video.style.display = "none";
             canvas.style.display = "block";
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ws = new WebSocket("ws://localhost:8000/ws");
+            
+            const wsUrl = `ws://${window.location.host}/ws`;
+            ws = new WebSocket(wsUrl);
             ws.onmessage = handleWebSocketMessage;
             ws.onopen = () => {
-                animationId = requestAnimationFrame(renderLoop); // render 60fps
-                sendFrameToServer();                              // send throttled
+                animationId = requestAnimationFrame(renderLoop);
+                sendFrameToServer();
             };
             ws.onclose = () => console.log("ws closed");
         } catch(e) { alert("Kamera tidak diizinkan atau error"); }
@@ -525,12 +573,10 @@ async def get_index():
         if (!cameraActive) return;
         paused = !paused;
         if (paused) {
-            // Render loop tetap jalan (video masih tampil + box tetap overlay)
-            // Hanya pengiriman ke server yang dihentikan
             cameraStatus.innerText = "🟡 Paused";
             btnPause.innerText = "▶ Resume";
         } else {
-            lastSendTime = 0; // kirim segera setelah resume
+            lastSendTime = 0;
             cameraStatus.innerText = "🟢 Live";
             btnPause.innerText = "⏸ Pause";
         }
@@ -561,12 +607,10 @@ async def get_index():
                 updateUI(result);
                 const img = new Image();
                 img.onload = () => {
-                    // Sesuaikan ukuran canvas dengan gambar asli
                     canvas.width  = img.naturalWidth;
                     canvas.height = img.naturalHeight;
                     ctx.drawImage(img, 0, 0);
                     if(result.box) {
-                        // Koordinat box sudah dalam ruang gambar asli — scaling 1:1
                         lastBox = {
                             box: result.box,
                             color: result.box_color,
@@ -574,7 +618,7 @@ async def get_index():
                             srcW: img.naturalWidth,
                             srcH: img.naturalHeight
                         };
-                        redrawBoxOnly();
+                        drawBoundingBox(result.box, result.box_color, `${result.skin_type} (${result.confidence}%)`, img.naturalWidth, img.naturalHeight);
                     }
                     video.style.display="none"; canvas.style.display="block"; placeholder.style.display="none";
                 };
@@ -702,7 +746,7 @@ Balas HANYA dalam format JSON berikut (tanpa markdown, tanpa penjelasan lain):
                     "contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": {
                         "temperature": 0.7,
-                        "maxOutputTokens": 8000  # ditingkatkan agar respons tidak terpotong
+                        "maxOutputTokens": 8000
                     }
                 }
             )
@@ -710,7 +754,6 @@ Balas HANYA dalam format JSON berikut (tanpa markdown, tanpa penjelasan lain):
             result = response.json()
             text = result["candidates"][0]["content"]["parts"][0]["text"]
 
-            # Bersihkan markdown
             text = text.strip()
             if text.startswith('```json'):
                 text = text[7:]
@@ -718,13 +761,11 @@ Balas HANYA dalam format JSON berikut (tanpa markdown, tanpa penjelasan lain):
                 text = text[:-3]
             text = text.strip()
 
-            # Coba parse langsung
             try:
                 ai_data = json.loads(text)
                 logging.info("Gemini AI berhasil memberikan rekomendasi")
                 return JSONResponse(ai_data)
             except json.JSONDecodeError:
-                # Gunakan json_repair untuk memperbaiki JSON yang mungkin terpotong
                 try:
                     repaired = repair_json(text)
                     ai_data = json.loads(repaired)
@@ -732,7 +773,6 @@ Balas HANYA dalam format JSON berikut (tanpa markdown, tanpa penjelasan lain):
                     return JSONResponse(ai_data)
                 except Exception as repair_e:
                     logging.error(f"Gagal memperbaiki JSON dengan json_repair: {repair_e}")
-                    # Coba ekstrak dengan regex sebagai fallback terakhir
                     match = re.search(r'\{.*\}', text, re.DOTALL)
                     if match:
                         json_str = match.group(0)
@@ -788,7 +828,6 @@ async def generate_pdf(
     from reportlab.lib.colors import HexColor, white, black
     import io
 
-    # ── Warna palette skincare premium ──
     PINK       = HexColor("#F45D9C")
     PINK_LIGHT = HexColor("#FFD6EA")
     PINK_DARK  = HexColor("#C93E7D")
@@ -800,13 +839,10 @@ async def generate_pdf(
     PROGRESS_BG = HexColor("#F0EEF5")
 
     pdf_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-    W, H = A4  # 595 x 842
+    W, H = A4
 
     c = rl_canvas.Canvas(pdf_path, pagesize=A4)
 
-    # ─────────────────────────────────────────
-    # Helper: rounded rectangle
-    # ─────────────────────────────────────────
     def rounded_rect(x, y, w, h, r, fill_color=None, stroke_color=None, stroke_width=1):
         if fill_color:
             c.setFillColor(fill_color)
@@ -828,27 +864,20 @@ async def generate_pdf(
         p.close()
         c.drawPath(p, fill=1 if fill_color else 0, stroke=1 if stroke_color else 0)
 
-    # ─────────────────────────────────────────
-    # PAGE 1 ── Header & Profile
-    # ─────────────────────────────────────────
-
-    # Background cream
+    # PAGE 1
     c.setFillColor(BG_CREAM)
     c.rect(0, 0, W, H, fill=1, stroke=0)
 
-    # Header gradient bar (simulate with two rects)
     c.setFillColor(PINK_DARK)
     c.rect(0, H - 110, W, 110, fill=1, stroke=0)
     c.setFillColor(PINK)
     c.rect(0, H - 110, W * 0.65, 110, fill=1, stroke=0)
 
-    # Decorative circles in header
     c.setFillColor(HexColor("#FFFFFF20"))
     c.circle(W - 60, H - 30, 70, fill=1, stroke=0)
     c.setFillColor(HexColor("#FFFFFF15"))
     c.circle(W - 20, H - 80, 50, fill=1, stroke=0)
 
-    # Logo / Brand name
     c.setFillColor(white)
     c.setFont("Helvetica-Bold", 26)
     c.drawString(36, H - 52, "SkinLens AI")
@@ -856,7 +885,6 @@ async def generate_pdf(
     c.setFillColor(PINK_LIGHT)
     c.drawString(36, H - 70, "Smart Skincare Analysis Report")
 
-    # Date/time badge on header right
     c.setFillColor(HexColor("#FFFFFF25"))
     rounded_rect(W - 200, H - 90, 165, 36, 8, fill_color=HexColor("#FFFFFF25"))
     c.setFillColor(white)
@@ -865,7 +893,6 @@ async def generate_pdf(
     c.setFont("Helvetica", 8)
     c.drawString(W - 192, H - 79, "  Analysis Date & Time")
 
-    # ── Patient Info Card ──
     card_y = H - 210
     rounded_rect(30, card_y, W - 60, 88, 12, fill_color=CARD_BG, stroke_color=PINK_LIGHT, stroke_width=1.5)
 
@@ -873,7 +900,6 @@ async def generate_pdf(
     c.setFont("Helvetica-Bold", 13)
     c.drawString(50, card_y + 62, "Patient Profile")
 
-    # Name & Age columns
     c.setFillColor(GRAY_TEXT)
     c.setFont("Helvetica", 9)
     c.drawString(50, card_y + 44, "FULL NAME")
@@ -895,9 +921,7 @@ async def generate_pdf(
     c.setFont("Helvetica-Bold", 11)
     c.drawString(400, card_y + 28, skin_type or "—")
 
-    # ── Confidence Score Hero ──
     hero_y = H - 340
-    # Left: big score circle
     cx_circle = 100
     cy_circle = hero_y + 55
     c.setFillColor(PINK_LIGHT)
@@ -911,7 +935,6 @@ async def generate_pdf(
     c.setFont("Helvetica", 8)
     c.drawCentredString(cx_circle, cy_circle - 14, "Confidence")
 
-    # Right: skin type label + description
     c.setFillColor(DARK_TEXT)
     c.setFont("Helvetica-Bold", 20)
     c.drawString(175, hero_y + 75, skin_type or "—")
@@ -925,7 +948,6 @@ async def generate_pdf(
     }
     c.drawString(175, hero_y + 58, descriptions.get(skin_type, "Analysis complete."))
 
-    # ── Skin Parameter Progress Bars ──
     section_y = H - 480
     c.setFillColor(PINK)
     c.setFont("Helvetica-Bold", 13)
@@ -941,45 +963,37 @@ async def generate_pdf(
 
     bar_start_y = section_y - 18
     bar_w_full  = (W - 72)
-    col_w       = bar_w_full / 3  # 3 columns
+    col_w       = bar_w_full / 3
     for i, (label, val, hex_color) in enumerate(params):
         col  = i % 3
         row  = i // 3
         bx   = 36 + col * col_w
         by   = bar_start_y - row * 62
 
-        # Card background
         rounded_rect(bx + 2, by - 36, col_w - 8, 56, 8, fill_color=CARD_BG)
 
-        # Label
         c.setFillColor(GRAY_TEXT)
         c.setFont("Helvetica", 8)
         c.drawString(bx + 12, by + 14, label.upper())
 
-        # Value
         c.setFillColor(HexColor(hex_color))
         c.setFont("Helvetica-Bold", 16)
         c.drawString(bx + 12, by - 4, f"{val}%")
 
-        # Progress bar track
         bar_track_w = col_w - 28
         c.setFillColor(PROGRESS_BG)
         rounded_rect(bx + 12, by - 24, bar_track_w, 8, 4, fill_color=PROGRESS_BG)
 
-        # Progress bar fill
         fill_w = max(6, int(bar_track_w * val / 100))
         c.setFillColor(HexColor(hex_color))
         rounded_rect(bx + 12, by - 24, fill_w, 8, 4, fill_color=HexColor(hex_color))
 
-    # ── Divider ──
     divider_y = section_y - 150
     c.setStrokeColor(PINK_LIGHT)
     c.setLineWidth(1)
     c.line(36, divider_y, W - 36, divider_y)
 
-    # ── Word-wrap helper ──
     def wrap_text(text, font_name, font_size, max_width):
-        """Split text into lines that fit within max_width using pdfgen string width."""
         from reportlab.pdfbase.pdfmetrics import stringWidth
         words = text.split()
         lines = []
@@ -998,14 +1012,13 @@ async def generate_pdf(
 
     FONT_REC  = "Helvetica"
     FONT_SIZE = 9
-    BOX_PAD_L = 16   # left padding inside box
-    BOX_PAD_R = 12   # right padding inside box
-    LINE_H    = 14   # vertical spacing per rendered line
+    BOX_PAD_L = 16
+    BOX_PAD_R = 12
+    LINE_H    = 14
 
-    half_w = (W - 72) / 2 - 6          # width of each half-box
-    inner_w = half_w - BOX_PAD_L - BOX_PAD_R  # usable text width inside box
+    half_w = (W - 72) / 2 - 6
+    inner_w = half_w - BOX_PAD_L - BOX_PAD_R
 
-    # ── Pre-render rec lines with wrapping ──
     rec_lines_raw = [l.strip() for l in recommendation.replace("\\n", "\n").split("\n") if l.strip()]
     rec_rendered = []
     for line in rec_lines_raw[:8]:
@@ -1014,18 +1027,15 @@ async def generate_pdf(
         wrapped = wrap_text(prefix + clean, FONT_REC, FONT_SIZE, inner_w)
         rec_rendered.extend(wrapped)
 
-    # ── Pre-render routine lines with wrapping ──
     routine_lines_raw = [l.strip() for l in routine.replace("\\n", "\n").split("\n") if l.strip()]
     routine_rendered = []
     for line in routine_lines_raw[:8]:
         wrapped = wrap_text(line, FONT_REC, FONT_SIZE, inner_w)
         routine_rendered.extend(wrapped)
 
-    # Box height driven by whichever side has more lines
     max_lines   = max(len(rec_rendered), len(routine_rendered), 5)
     rec_box_h   = max_lines * LINE_H + 28
 
-    # ── Recommendation Section ──
     rec_y = divider_y - 22
     c.setFillColor(PINK)
     c.setFont("Helvetica-Bold", 13)
@@ -1039,7 +1049,6 @@ async def generate_pdf(
     for idx, line in enumerate(rec_rendered):
         c.drawString(36 + BOX_PAD_L, rec_y - 28 - idx * LINE_H, line)
 
-    # ── Routine Section ──
     rx = 36 + half_w + 6
     c.setFillColor(PINK)
     c.setFont("Helvetica-Bold", 13)
@@ -1053,7 +1062,6 @@ async def generate_pdf(
     for idx, line in enumerate(routine_rendered):
         c.drawString(rx + BOX_PAD_L, rec_y - 28 - idx * LINE_H, line)
 
-    # ── Footer ──
     footer_y = 28
     c.setFillColor(PINK)
     c.rect(0, 0, W, footer_y + 10, fill=1, stroke=0)
@@ -1061,16 +1069,12 @@ async def generate_pdf(
     c.setFont("Helvetica", 8)
     c.drawCentredString(W / 2, footer_y - 4, "Generated by SkinLens AI  •  For informational purposes only  •  Consult a dermatologist for medical advice")
 
-    # ─────────────────────────────────────────
-    # PAGE 2 ── Bar Chart
-    # ─────────────────────────────────────────
+    # PAGE 2 - Bar Chart
     c.showPage()
 
-    # Background
     c.setFillColor(BG_CREAM)
     c.rect(0, 0, W, H, fill=1, stroke=0)
 
-    # Header strip
     c.setFillColor(PINK)
     c.rect(0, H - 70, W, 70, fill=1, stroke=0)
     c.setFillColor(white)
@@ -1080,7 +1084,6 @@ async def generate_pdf(
     c.setFillColor(PINK_LIGHT)
     c.drawString(36, H - 58, f"{name}  |  {date}  {time}")
 
-    # Generate chart with matplotlib
     fig, ax = plt.subplots(figsize=(7.5, 4.2))
     fig.patch.set_facecolor('#FFF5F9')
     ax.set_facecolor('#FFF5F9')
@@ -1123,7 +1126,6 @@ async def generate_pdf(
     c.drawImage(chart_img, 36, H - 110 - chart_h, width=chart_w, height=chart_h,
                 preserveAspectRatio=True, mask='auto')
 
-    # ── Metric summary cards below chart ──
     summary_y = H - 110 - chart_h - 50
     c.setFillColor(DARK_TEXT)
     c.setFont("Helvetica-Bold", 12)
@@ -1159,23 +1161,18 @@ async def generate_pdf(
         c.setFont("Helvetica-Bold", 8)
         c.drawCentredString(cx_ + cw / 2, cy_ + 4, status)
 
-    # ── Footer page 2 ──
     c.setFillColor(PINK)
     c.rect(0, 0, W, 38, fill=1, stroke=0)
     c.setFillColor(white)
     c.setFont("Helvetica", 8)
     c.drawCentredString(W / 2, 14, "Generated by SkinLens AI  •  For informational purposes only  •  Consult a dermatologist for medical advice")
 
-    # ─────────────────────────────────────────
-    # PAGE 3 ── Line Graph & Pie Chart
-    # ─────────────────────────────────────────
+    # PAGE 3 - Line Graph & Pie Chart
     c.showPage()
 
-    # Background
     c.setFillColor(BG_CREAM)
     c.rect(0, 0, W, H, fill=1, stroke=0)
 
-    # Header strip
     c.setFillColor(PINK)
     c.rect(0, H - 70, W, 70, fill=1, stroke=0)
     c.setFillColor(white)
@@ -1185,11 +1182,6 @@ async def generate_pdf(
     c.setFillColor(PINK_LIGHT)
     c.drawString(36, H - 58, f"{name}  |  {date}  {time}")
 
-    param_labels = ["Moisture", "Sebum", "Acne", "Blackspot", "Wrinkle"]
-    param_values = [moisture, oil, acne, blackspot, wrinkle]
-    bar_colors   = ["#36B5FF", "#FF9F3D", "#F45D9C", "#9C6FDB", "#FF6B6B"]
-
-    # ── Line Graph (top half) ──
     fig_line, ax_line = plt.subplots(figsize=(7.5, 3.5))
     fig_line.patch.set_facecolor('#FFF5F9')
     ax_line.set_facecolor('#FFF5F9')
@@ -1199,10 +1191,8 @@ async def generate_pdf(
                  marker='o', markersize=9, markerfacecolor='white',
                  markeredgecolor='#F45D9C', markeredgewidth=2.5, zorder=3)
 
-    # Fill area under line
     ax_line.fill_between(x_pos, param_values, alpha=0.12, color='#F45D9C')
 
-    # Annotate each point
     for xi, yi in zip(x_pos, param_values):
         ax_line.annotate(f"{yi}%", (xi, yi),
                          textcoords="offset points", xytext=(0, 10),
@@ -1237,17 +1227,14 @@ async def generate_pdf(
     c.drawImage(line_img, 36, line_y, width=line_w, height=line_h,
                 preserveAspectRatio=True, mask='auto')
 
-    # Section label
     c.setFillColor(PINK)
     c.setFont("Helvetica-Bold", 12)
     c.drawString(36, line_y - 22, "Line Graph — Skin Parameter Trend")
 
-    # ── Pie Chart (bottom half) ──
     fig_pie, ax_pie = plt.subplots(figsize=(6, 4))
     fig_pie.patch.set_facecolor('#FFF5F9')
     ax_pie.set_facecolor('#FFF5F9')
 
-    # Explode the largest slice slightly
     max_idx = param_values.index(max(param_values))
     explode = [0.05 if i == max_idx else 0 for i in range(len(param_values))]
 
@@ -1287,12 +1274,10 @@ async def generate_pdf(
     c.drawImage(pie_img, 36, pie_y, width=pie_w, height=pie_h,
                 preserveAspectRatio=True, mask='auto')
 
-    # Section label
     c.setFillColor(PINK)
     c.setFont("Helvetica-Bold", 12)
     c.drawString(36, pie_y - 20, "Pie Chart — Parameter Composition")
 
-    # ── Footer page 3 ──
     c.setFillColor(PINK)
     c.rect(0, 0, W, 38, fill=1, stroke=0)
     c.setFillColor(white)
@@ -1303,6 +1288,12 @@ async def generate_pdf(
 
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"skin_report_{name or 'user'}.pdf")
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint untuk Railway"""
+    return {"status": "healthy", "model_loaded": os.path.exists("skin_model.h5")}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
