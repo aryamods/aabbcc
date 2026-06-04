@@ -1,76 +1,88 @@
 import os
+import sys
 import json
 import logging
 import random
 import tempfile
 import asyncio
 import re
-import sys
+import urllib.request
 
-# IMPORTANT: Set headless mode BEFORE importing OpenCV
+# IMPORTANT: Set headless mode BEFORE importing any GUI libraries
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
-os.environ['DISPLAY'] = ':0'
+os.environ['DISPLAY'] = ':99'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # Suppress oneDNN warnings
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-# Now import libraries safely
-import numpy as np
-import tensorflow as tf
-
-# Load OpenCV with headless configuration
+# Import libraries with error handling
 try:
-    import cv2
-    # Test if cv2 works properly
-    cv2.setNumThreads(0)  # Disable threading for headless
+    import numpy as np
+    import tensorflow as tf
 except ImportError as e:
-    logging.error(f"Failed to import cv2: {e}")
-    logging.error("Make sure opencv-python-headless is installed")
+    print(f"Failed to import numpy/tensorflow: {e}")
     sys.exit(1)
 
-import mediapipe as mp
-import httpx
-from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend for headless
-import matplotlib.pyplot as plt
-from json_repair import repair_json
-from dotenv import load_dotenv
+# Import OpenCV with special handling for headless environment
+try:
+    import cv2
+    # Test if cv2 works
+    cv2.setNumThreads(0)
+    print("OpenCV loaded successfully in headless mode")
+except ImportError as e:
+    print(f"Failed to import cv2: {e}")
+    print("Make sure opencv-python-headless is installed")
+    sys.exit(1)
+except Exception as e:
+    print(f"OpenCV initialization error: {e}")
+    sys.exit(1)
+
+try:
+    import mediapipe as mp
+    import httpx
+    from datetime import datetime
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
+    from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend for headless
+    import matplotlib.pyplot as plt
+    from json_repair import repair_json
+    from dotenv import load_dotenv
+except ImportError as e:
+    print(f"Failed to import required modules: {e}")
+    sys.exit(1)
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
-# Setup logging ke terminal
+# Setup logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Konfigurasi Gemini API dari environment variable
+# Konfigurasi Gemini API
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 if not GEMINI_API_KEY:
-    logging.warning("GEMINI_API_KEY not set! AI recommendations will use fallback.")
+    logger.warning("GEMINI_API_KEY not set! AI recommendations will use fallback.")
 
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={GEMINI_API_KEY}"
 
-# Fungsi untuk download model dari Google Drive (untuk Railway deployment)
+# Fungsi untuk download model dari Google Drive
 def ensure_model_downloaded():
     """Download model from Google Drive if not exists (for Railway deployment)"""
     if os.path.exists("skin_model.h5"):
-        logging.info("✅ Model already exists, skipping download")
+        logger.info("✅ Model already exists, skipping download")
         return True
     
-    logging.info("📥 Model not found, downloading from Google Drive...")
+    logger.info("📥 Model not found, downloading from Google Drive...")
     
-    # Ganti dengan FILE ID Google Drive Anda
-    # Cara dapatkan FILE ID: dari URL share Google Drive
-    # Contoh: https://drive.google.com/file/d/1ABC123xyz/view -> FILE ID = 1ABC123xyz
-    FILE_ID = os.getenv("MODEL_FILE_ID", "YOUR_GOOGLE_DRIVE_FILE_ID_HERE")
+    FILE_ID = os.getenv("MODEL_FILE_ID", "")
     
-    if FILE_ID == "YOUR_GOOGLE_DRIVE_FILE_ID_HERE":
-        logging.error("❌ MODEL_FILE_ID not set in environment variables!")
-        logging.error("Please set MODEL_FILE_ID in Railway Variables")
+    if not FILE_ID or FILE_ID == "YOUR_GOOGLE_DRIVE_FILE_ID_HERE":
+        logger.error("❌ MODEL_FILE_ID not set in environment variables!")
+        logger.error("Please set MODEL_FILE_ID in Railway Variables")
         return False
     
     try:
@@ -80,80 +92,94 @@ def ensure_model_downloaded():
         
         if os.path.exists("skin_model.h5"):
             size = os.path.getsize("skin_model.h5") / (1024 * 1024)
-            logging.info(f"✅ Model downloaded successfully! Size: {size:.2f} MB")
+            logger.info(f"✅ Model downloaded successfully! Size: {size:.2f} MB")
             return True
         else:
-            logging.error("❌ Download failed - file not found")
+            logger.error("❌ Download failed - file not found")
             return False
     except ImportError:
-        logging.error("❌ gdown not installed! Please add gdown to requirements.txt")
+        logger.error("❌ gdown not installed! Please add gdown to requirements.txt")
         return False
     except Exception as e:
-        logging.error(f"❌ Download error: {e}")
+        logger.error(f"❌ Download error: {e}")
         return False
 
-# Download model jika diperlukan (untuk Railway)
-# Untuk local development, pastikan file skin_model.h5 sudah ada
+# Load model
+model = None
+labels = ["Acne", "Dry", "Normal", "Oily"]
+
 if not os.path.exists("skin_model.h5"):
     success = ensure_model_downloaded()
     if not success:
-        logging.warning("⚠️ Could not download model, using mock model for testing")
-        # Create mock model for testing if download fails
+        logger.warning("⚠️ Could not download model, using mock model for testing")
         class MockModel:
             def predict(self, x, verbose=0):
                 return np.random.dirichlet(np.ones(4), size=1)
         model = MockModel()
-        labels = ["Acne", "Dry", "Normal", "Oily"]
     else:
-        # Load model klasifikasi kulit dan label
-        model = tf.keras.models.load_model("skin_model.h5")
-        labels = ["Acne", "Dry", "Normal", "Oily"]
+        try:
+            model = tf.keras.models.load_model("skin_model.h5")
+            logger.info("✅ Model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            model = None
 else:
-    # Load model klasifikasi kulit dan label
-    model = tf.keras.models.load_model("skin_model.h5")
-    labels = ["Acne", "Dry", "Normal", "Oily"]
+    try:
+        model = tf.keras.models.load_model("skin_model.h5")
+        logger.info("✅ Model loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        model = None
 
 # Load face detector dari MediaPipe
+face_detector = None
 try:
-    # MediaPipe options for headless environment
-    base_options = mp.tasks.BaseOptions(
-        model_asset_path="face_detection_short_range.tflite"
-    )
+    # Download face detection model if not exists
+    if not os.path.exists("face_detection_short_range.tflite"):
+        logger.info("Downloading face detection model...")
+        url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float32/1/face_detection_short_range.tflite"
+        urllib.request.urlretrieve(url, "face_detection_short_range.tflite")
+        logger.info("Face detection model downloaded")
+    
+    base_options = mp.tasks.BaseOptions(model_asset_path="face_detection_short_range.tflite")
     options = mp.tasks.vision.FaceDetectorOptions(
         base_options=base_options,
         min_detection_confidence=0.75,
         running_mode=mp.tasks.vision.RunningMode.IMAGE
     )
     face_detector = mp.tasks.vision.FaceDetector.create_from_options(options)
+    logger.info("✅ Face detector loaded successfully")
 except Exception as e:
-    logging.error(f"Failed to load face detector: {e}")
+    logger.error(f"Failed to load face detector: {e}")
     face_detector = None
 
 # ---------- Helper functions ----------
 def get_static_recommendation(skin_type):
     """Rekomendasi statis (fallback) jika AI tidak tersedia."""
-    if skin_type == "Acne":
-        return {
+    recommendations = {
+        "Acne": {
             "rec": "• Salicylic Acid 2%\n• Niacinamide Serum\n• Gentle Cleanser\n• Oil-Free Moisturizer\n• Sunscreen SPF 50",
             "routine": "☀️ Pagi: Gentle cleanser → Niacinamide → Moisturizer → SPF\n🌙 Malam: Cleanse → Salicylic acid → Moisturizer"
-        }
-    if skin_type == "Dry":
-        return {
+        },
+        "Dry": {
             "rec": "• Hyaluronic Acid\n• Ceramide Cream\n• Hydrating Cleanser\n• Night Cream",
             "routine": "☀️ Pagi: Hydrating cleanser → Hyaluronic acid → Moisturizer → SPF\n🌙 Malam: Gentle cleanser → Hydrating serum → Night cream"
-        }
-    if skin_type == "Oily":
-        return {
+        },
+        "Oily": {
             "rec": "• Oil-control Cleanser\n• Niacinamide\n• Gel Moisturizer\n• Non-comedogenic SPF",
             "routine": "☀️ Pagi: Oil control wash → Niacinamide → Gel moisturizer → SPF\n🌙 Malam: Face wash → Salicylic serum → Light moisturizer"
         }
-    return {
+    }
+    return recommendations.get(skin_type, {
         "rec": "• Maintain routine\n• Daily SPF\n• Hydration\n• Light moisturizer",
         "routine": "☀️ Pagi: Gentle cleanse → Moisturizer → SPF\n🌙 Malam: Cleanse → Night cream"
-    }
+    })
 
 def process_frame(frame_bytes):
     """Deteksi wajah, klasifikasi jenis kulit, dan hitung parameter kulit."""
+    if model is None or face_detector is None:
+        return None
+        
     try:
         np_arr = np.frombuffer(frame_bytes, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -163,9 +189,6 @@ def process_frame(frame_bytes):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         
-        if face_detector is None:
-            return None
-            
         results = face_detector.detect(mp_image)
 
         h, w, _ = frame.shape
@@ -198,9 +221,9 @@ def process_frame(frame_bytes):
                 pred = model.predict(img, verbose=0)
                 class_id = np.argmax(pred)
                 confidence = int(np.max(pred) * 100)
-                skin_type = labels[class_id]
+                skin_type = labels[class_id] if class_id < len(labels) else "Normal"
 
-                # Simulasi skor parameter kulit (untuk demo)
+                # Simulasi skor parameter kulit
                 moisture = random.randint(60, 95)
                 oil = random.randint(35, 90)
                 acne = random.randint(5, 80)
@@ -212,14 +235,12 @@ def process_frame(frame_bytes):
                 current_time = now.strftime("%H:%M:%S")
 
                 # Warna bounding box berdasarkan jenis kulit
-                if skin_type == "Acne":
-                    box_color = "#FF0000"
-                elif skin_type == "Oily":
-                    box_color = "#FFFF00"
-                elif skin_type == "Dry":
-                    box_color = "#FF7800"
-                else:
-                    box_color = "#00FF00"
+                box_color_map = {
+                    "Acne": "#FF0000",
+                    "Oily": "#FFFF00",
+                    "Dry": "#FF7800"
+                }
+                box_color = box_color_map.get(skin_type, "#00FF00")
 
                 detection_data = {
                     "skin_type": skin_type,
@@ -238,7 +259,7 @@ def process_frame(frame_bytes):
 
         return detection_data, frame.shape[:2] if detection_data else None
     except Exception as e:
-        logging.error(f"Error processing frame: {e}")
+        logger.error(f"Error processing frame: {e}")
         return None
 
 # ---------- API Endpoints ----------
@@ -253,67 +274,65 @@ async def get_index():
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Poppins', system-ui; background: linear-gradient(145deg, #fdf2f8 0%, #fbe9f2 100%); transition: background 0.3s; min-height: 100vh; }
-        body.dark { background: linear-gradient(145deg, #121212 0%, #1e1e2a 100%); }
+        body { font-family: 'Poppins', system-ui, -apple-system, sans-serif; background: linear-gradient(145deg, #fdf2f8 0%, #fbe9f2 100%); transition: background 0.3s; min-height: 100vh; }
+        body.dark { background: linear-gradient(145deg, #121212 0%, #1e1e2a 100%); color: #f0f0f0; }
         .dashboard { display: flex; gap: 1.25rem; padding: 1.25rem; max-width: 1600px; margin: 0 auto; }
-        .sidebar { width: 300px; background: rgba(255,255,255,0.85); backdrop-filter: blur(12px); border-radius: 2rem; padding: 1.5rem; display: flex; flex-direction: column; gap: 1.25rem; position: sticky; top: 1.25rem; }
+        .sidebar { width: 300px; background: rgba(255,255,255,0.85); backdrop-filter: blur(12px); border-radius: 2rem; padding: 1.5rem; display: flex; flex-direction: column; gap: 1.25rem; position: sticky; top: 1.25rem; height: fit-content; }
         body.dark .sidebar { background: rgba(30,30,40,0.85); }
         .logo { font-size: 1.7rem; font-weight: 800; background: linear-gradient(135deg, #F45D9C, #FF9F3D); -webkit-background-clip: text; background-clip: text; color: transparent; }
         .section-title { font-size: 1rem; font-weight: 600; color: #F45D9C; text-transform: uppercase; margin: 0.75rem 0 0.25rem 0; }
-        .user-input { background: rgba(255,247,251,0.9); border: 1.5px solid rgba(244,93,156,0.3); border-radius: 1.5rem; padding: 0.75rem 1rem; width: 100%; margin-top: 0.5rem; }
+        .user-input { background: rgba(255,247,251,0.9); border: 1.5px solid rgba(244,93,156,0.3); border-radius: 1.5rem; padding: 0.75rem 1rem; width: 100%; margin-top: 0.5rem; font-family: inherit; }
+        body.dark .user-input { background: rgba(30,30,50,0.9); border-color: rgba(244,93,156,0.4); color: #f0f0f0; }
         .buttons { display: flex; flex-direction: column; gap: 0.7rem; }
-        .sidebar-btn { background: rgba(255,255,255,0.7); border: none; border-radius: 2rem; padding: 0.85rem 1rem; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 0.7rem; }
-        .sidebar-btn:hover { background: #F45D9C; color: white; }
+        .sidebar-btn { background: rgba(255,255,255,0.7); border: none; border-radius: 2rem; padding: 0.85rem 1rem; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 0.7rem; font-family: inherit; transition: all 0.2s; }
+        body.dark .sidebar-btn { background: rgba(40,40,60,0.8); color: #e0e0f0; }
+        .sidebar-btn:hover { background: #F45D9C; color: white; transform: translateX(5px); }
         .sidebar-btn.active { background: #F45D9C; color: white; }
-        .camera-status { background: rgba(244,93,156,0.1); border-radius: 2rem; text-align: center; padding: 0.75rem; color: #F45D9C; margin-top: auto; }
+        .camera-status { background: rgba(244,93,156,0.1); border-radius: 2rem; text-align: center; padding: 0.75rem; color: #F45D9C; margin-top: auto; font-weight: 600; }
         .center { flex: 1; display: flex; flex-direction: column; gap: 1.25rem; }
-        .header { background: rgba(255,255,255,0.75); backdrop-filter: blur(10px); border-radius: 2rem; text-align: center; padding: 1.2rem; font-weight: 700; color: #F45D9C; }
+        .header { background: rgba(255,255,255,0.75); backdrop-filter: blur(10px); border-radius: 2rem; text-align: center; padding: 1.2rem; font-weight: 700; color: #F45D9C; font-size: 1.2rem; }
+        body.dark .header { background: rgba(30,30,40,0.75); color: #ff85bc; }
         .video-container { background: rgba(255,255,255,0.5); border-radius: 2rem; position: relative; overflow: hidden; width: 100%; aspect-ratio: 4/3; }
+        body.dark .video-container { background: rgba(30,30,40,0.5); }
         #canvasPreview { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; background: #f0eef3; display: block; }
+        body.dark #canvasPreview { background: #2a2a35; }
         #video { display: none; }
-        .placeholder { font-size: 1.2rem; color: #aaa; text-align: center; z-index: 2; }
-        .right-panel { width: 340px; background: rgba(255,255,255,0.75); backdrop-filter: blur(12px); border-radius: 2rem; padding: 1.5rem; display: flex; flex-direction: column; gap: 1rem; position: sticky; top: 1.25rem; }
+        .placeholder { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.2rem; color: #aaa; text-align: center; z-index: 2; pointer-events: none; }
+        .right-panel { width: 340px; background: rgba(255,255,255,0.75); backdrop-filter: blur(12px); border-radius: 2rem; padding: 1.5rem; display: flex; flex-direction: column; gap: 1rem; position: sticky; top: 1.25rem; height: fit-content; }
+        body.dark .right-panel { background: rgba(30,30,40,0.85); }
         .analysis-title { font-size: 1.5rem; font-weight: 800; color: #F45D9C; }
         .confidence { font-size: 3.2rem; font-weight: 800; text-align: center; background: linear-gradient(135deg, #F45D9C, #ffad7a); -webkit-background-clip: text; background-clip: text; color: transparent; }
         .skin-condition { font-size: 1.4rem; font-weight: 700; text-align: center; background: #F45D9C20; display: inline-block; margin: 0 auto; padding: 0.3rem 1rem; border-radius: 3rem; }
         .datetime { display: flex; justify-content: space-between; font-size: 0.75rem; background: rgba(0,0,0,0.03); padding: 0.5rem; border-radius: 1rem; }
+        body.dark .datetime { background: rgba(255,255,255,0.06); color: #c8c8d8; }
         .progress-item { margin: 0.2rem 0; }
         .progress-item label { font-weight: 600; font-size: 0.8rem; display: flex; justify-content: space-between; }
         progress { width: 100%; height: 8px; border-radius: 20px; overflow: hidden; margin-top: 5px; }
         progress::-webkit-progress-bar { background: #e9e9ef; }
-        progress::-webkit-progress-value { background: #F45D9C; }
+        progress::-webkit-progress-value { background: #F45D9C; border-radius: 20px; }
+        body.dark progress::-webkit-progress-bar { background: #333350; }
+        body.dark progress::-webkit-progress-value { background: linear-gradient(90deg, #F45D9C, #ff9f3d); }
         .rec-box { background: rgba(244,93,156,0.08); border-radius: 1.5rem; padding: 1rem; font-size: 0.75rem; line-height: 1.5; white-space: pre-line; }
+        body.dark .rec-box { background: rgba(244,93,156,0.12); border: 1px solid rgba(244,93,156,0.2); }
         .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; }
         .modal-content { background: white; padding: 1.5rem; border-radius: 2rem; width: 90%; max-width: 550px; }
         body.dark .modal-content { background: #1f1f2e; color: #eee; }
         .close, .close-chart { float: right; font-size: 1.8rem; cursor: pointer; }
-        @media (max-width: 1100px) { .sidebar { width: 100%; flex-direction: row; flex-wrap: wrap; } .right-panel { width: 100%; } }
-
-        body.dark { color: #f0f0f0; }
-        body.dark .sidebar { color: #f0f0f0; }
-        body.dark .right-panel { color: #f0f0f0; background: rgba(30,30,40,0.85); }
-        body.dark .section-title { color: #ff85bc; }
-        body.dark .header { color: #ff85bc; background: rgba(30,30,40,0.75); }
-        body.dark .analysis-title { color: #ff85bc; }
-        body.dark .skin-condition { color: #f0f0f0; background: rgba(244,93,156,0.25); }
-        body.dark .datetime { color: #c8c8d8; background: rgba(255,255,255,0.06); }
-        body.dark .datetime span { color: #c8c8d8; }
-        body.dark .progress-item label { color: #e0e0f0; }
-        body.dark .progress-item label span { color: #e0e0f0; }
-        body.dark progress::-webkit-progress-bar { background: #333350; }
-        body.dark progress::-webkit-progress-value { background: linear-gradient(90deg, #F45D9C, #ff9f3d); }
-        body.dark .rec-box { background: rgba(244,93,156,0.12); color: #eee; border: 1px solid rgba(244,93,156,0.2); }
-        body.dark .user-input { background: rgba(30,30,50,0.9); border-color: rgba(244,93,156,0.4); color: #f0f0f0; }
-        body.dark .user-input::placeholder { color: #888; }
-        body.dark .sidebar-btn { background: rgba(40,40,60,0.8); color: #e0e0f0; }
-        body.dark .sidebar-btn:hover { background: #F45D9C; color: white; }
-        body.dark .sidebar-btn.active { background: #F45D9C; color: white; }
-        body.dark .camera-status { color: #ff85bc; background: rgba(244,93,156,0.15); }
-        body.dark .detect-info { color: #e0e0f0; }
-        body.dark .placeholder { color: #888; }
-        body.dark .modal-content h3 { color: #ff85bc; }
-        body.dark .modal-content pre { color: #e0e0f0; }
-        body.dark .close, body.dark .close-chart { color: #e0e0f0; }
+        .detect-info { text-align: center; padding: 0.5rem; color: #666; }
+        body.dark .detect-info { color: #aaa; }
+        @media (max-width: 1100px) { 
+            .dashboard { flex-direction: column; }
+            .sidebar { width: 100%; flex-direction: row; flex-wrap: wrap; position: static; }
+            .right-panel { width: 100%; position: static; }
+            .buttons { flex-direction: row; flex-wrap: wrap; }
+            .sidebar-btn { flex: 1; justify-content: center; }
+        }
+        @media (max-width: 768px) {
+            .dashboard { padding: 0.75rem; gap: 0.75rem; }
+            .sidebar { padding: 1rem; }
+            .right-panel { padding: 1rem; }
+            .confidence { font-size: 2.5rem; }
+        }
     </style>
 </head>
 <body>
@@ -361,7 +380,7 @@ async def get_index():
         <div><div class="section-title">🧼 Daily Routine</div><div class="rec-box" id="routineText">—</div></div>
     </aside>
 </div>
-<div id="historyModal" class="modal"><div class="modal-content"><span class="close">&times;</span><h3>📜 History Analysis</h3><pre id="historyList"></pre></div></div>
+<div id="historyModal" class="modal"><div class="modal-content"><span class="close">&times;</span><h3>📜 History Analysis</h3><pre id="historyList" style="white-space: pre-wrap; margin-top: 1rem;"></pre></div></div>
 <div id="chartModal" class="modal"><div class="modal-content"><span class="close-chart">&times;</span><canvas id="resultChart" width="500" height="300"></canvas></div></div>
 <script>
     const video = document.getElementById('video');
@@ -491,7 +510,7 @@ async def get_index():
         ctx.strokeStyle = color;
         ctx.lineWidth   = 3;
         ctx.strokeRect(sx1, sy1, sw, sh);
-        ctx.font = "bold 15px 'Poppins', sans-serif";
+        ctx.font = "bold 15px 'Poppins', system-ui, sans-serif";
         const textW = ctx.measureText(label).width;
         ctx.fillStyle = color + 'cc';
         ctx.fillRect(sx1 - 1, sy1 - 22, textW + 10, 22);
@@ -540,7 +559,7 @@ async def get_index():
         ctx.strokeStyle = color;
         ctx.lineWidth   = 3;
         ctx.strokeRect(x, y, w, h);
-        ctx.font = "bold 15px 'Poppins', sans-serif";
+        ctx.font = "bold 15px 'Poppins', system-ui, sans-serif";
         const textW = ctx.measureText(label).width;
         ctx.fillStyle = color + 'cc';
         ctx.fillRect(x - 1, y - 22, textW + 10, 22);
@@ -594,7 +613,7 @@ async def get_index():
                 sendFrameToServer();
             };
             ws.onclose = () => console.log("ws closed");
-        } catch(e) { alert("Kamera tidak diizinkan atau error"); }
+        } catch(e) { alert("Kamera tidak diizinkan atau error: " + e.message); }
     }
 
     function pauseCamera() {
@@ -612,12 +631,12 @@ async def get_index():
 
     function stopCamera() {
         if(stream) { stream.getTracks().forEach(t => t.stop()); stream=null; }
-        if(ws) ws.close();
+        if(ws) { ws.close(); ws=null; }
         if(animationId) { cancelAnimationFrame(animationId); animationId=null; }
         cameraActive=false; paused=false; lastBox=null; targetBox=null; smoothBox=null;
         video.style.display="none"; canvas.style.display="none"; placeholder.style.display="flex";
         cameraStatus.innerText="🔴 Offline";
-        detectInfo.innerText="Ready";
+        detectInfo.innerText="✨ Ready to analyze your skin";
         btnPause.innerText="⏸ Pause";
     }
 
@@ -639,13 +658,6 @@ async def get_index():
                     canvas.height = img.naturalHeight;
                     ctx.drawImage(img, 0, 0);
                     if(result.box) {
-                        lastBox = {
-                            box: result.box,
-                            color: result.box_color,
-                            label: `${result.skin_type} (${result.confidence}%)`,
-                            srcW: img.naturalWidth,
-                            srcH: img.naturalHeight
-                        };
                         drawBoundingBox(result.box, result.box_color, `${result.skin_type} (${result.confidence}%)`, img.naturalWidth, img.naturalHeight);
                     }
                     video.style.display="none"; canvas.style.display="block"; placeholder.style.display="none";
@@ -665,6 +677,7 @@ async def get_index():
         recommendationDiv.innerText="Belum ada rekomendasi";
         routineDiv.innerText="—";
         historyList=[];
+        currentResult=null;
         lastBox=null; targetBox=null; smoothBox=null; lastAICallTime=0; lastAISkinType=null;
         if(!cameraActive) { canvas.style.display="none"; placeholder.style.display="flex"; ctx.clearRect(0,0,canvas.width,canvas.height); }
         alert("Data cleared");
@@ -685,7 +698,7 @@ async def get_index():
         modal.style.display="flex";
         const canvasChart=document.getElementById('resultChart');
         if(chart) chart.destroy();
-        chart = new Chart(canvasChart, { type:'bar', data:{ labels:['Moisture','Sebum','Acne','Blackspot','Wrinkle'], datasets:[{ label:'Skor (%)', data:[currentResult.moisture,currentResult.oil,currentResult.acne,currentResult.blackspot,currentResult.wrinkle], backgroundColor:'#F45D9C', borderRadius:8 }] }, options:{ scales:{ y:{ beginAtZero:true, max:100 } }, responsive:true, maintainAspectRatio:true } });
+        chart = new Chart(canvasChart, { type:'bar', data:{ labels:['Moisture','Sebum','Acne','Blackspot','Wrinkle'], datasets:[{ label:'Skor (%)', data:[currentResult.moisture,currentResult.oil,currentResult.acne,currentResult.blackspot,currentResult.wrinkle], backgroundColor:'#F45D9C', borderRadius:8 }] }, options:{ responsive:true, maintainAspectRatio:true, scales:{ y:{ beginAtZero:true, max:100, title:{ display:true, text:'Percentage (%)' } }, x:{ title:{ display:true, text:'Parameters' } } } } });
         document.querySelector('#chartModal .close-chart').onclick=()=>modal.style.display="none";
     }
 
@@ -703,6 +716,7 @@ async def get_index():
     }
 
     function setActive(btn) { document.querySelectorAll('.sidebar-btn').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); }
+    
     btnOpen.onclick = () => { setActive(btnOpen); startCamera(); };
     btnPause.onclick = () => { setActive(btnPause); pauseCamera(); };
     btnClose.onclick = () => { setActive(btnClose); stopCamera(); };
@@ -712,6 +726,10 @@ async def get_index():
     btnResult.onclick = () => { setActive(btnResult); showResultAnalysis(); };
     btnPdf.onclick = () => { setActive(btnPdf); downloadPDF(); };
     btnDark.onclick = () => { setActive(btnDark); toggleDarkMode(); };
+    
+    // Initialize placeholder
+    canvas.style.display = "none";
+    placeholder.style.display = "flex";
 </script>
 </body>
 </html>"""
@@ -730,7 +748,9 @@ async def websocket_endpoint(websocket: WebSocket):
             else:
                 await websocket.send_json({"error": "No face detected"})
     except WebSocketDisconnect:
-        pass
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
 
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
@@ -744,15 +764,20 @@ async def upload_image(file: UploadFile = File(...)):
 @app.post("/recommendations")
 async def get_ai_recommendations(request: Request):
     data = await request.json()
-    skin_type = data.get("skin_type")
-    confidence = data.get("confidence")
-    moisture = data.get("moisture")
-    oil = data.get("oil")
-    acne = data.get("acne")
-    blackspot = data.get("blackspot")
-    wrinkle = data.get("wrinkle")
+    skin_type = data.get("skin_type", "Normal")
+    confidence = data.get("confidence", 0)
+    moisture = data.get("moisture", 0)
+    oil = data.get("oil", 0)
+    acne = data.get("acne", 0)
+    blackspot = data.get("blackspot", 0)
+    wrinkle = data.get("wrinkle", 0)
     name = data.get("name", "User")
     age = data.get("age", "tidak diketahui")
+
+    # If no API key, return static recommendations
+    if not GEMINI_API_KEY:
+        fallback = get_static_recommendation(skin_type)
+        return JSONResponse(fallback)
 
     prompt = f"""Kamu adalah dermatologis AI. Berikan rekomendasi perawatan kulit berdasarkan data analisis berikut:
 
@@ -776,7 +801,8 @@ Balas HANYA dalam format JSON berikut (tanpa markdown, tanpa penjelasan lain):
                         "temperature": 0.7,
                         "maxOutputTokens": 8000
                     }
-                }
+                },
+                headers={"Content-Type": "application/json"}
             )
             response.raise_for_status()
             result = response.json()
@@ -785,45 +811,47 @@ Balas HANYA dalam format JSON berikut (tanpa markdown, tanpa penjelasan lain):
             text = text.strip()
             if text.startswith('```json'):
                 text = text[7:]
+            if text.startswith('```'):
+                text = text[3:]
             if text.endswith('```'):
                 text = text[:-3]
             text = text.strip()
 
             try:
                 ai_data = json.loads(text)
-                logging.info("Gemini AI berhasil memberikan rekomendasi")
+                logger.info("Gemini AI berhasil memberikan rekomendasi")
                 return JSONResponse(ai_data)
             except json.JSONDecodeError:
                 try:
                     repaired = repair_json(text)
                     ai_data = json.loads(repaired)
-                    logging.info("Gemini AI berhasil memberikan rekomendasi (diperbaiki dengan json_repair)")
+                    logger.info("Gemini AI berhasil memberikan rekomendasi (diperbaiki dengan json_repair)")
                     return JSONResponse(ai_data)
                 except Exception as repair_e:
-                    logging.error(f"Gagal memperbaiki JSON dengan json_repair: {repair_e}")
+                    logger.error(f"Gagal memperbaiki JSON dengan json_repair: {repair_e}")
                     match = re.search(r'\{.*\}', text, re.DOTALL)
                     if match:
                         json_str = match.group(0)
                         try:
                             ai_data = json.loads(json_str)
-                            logging.info("Gemini AI berhasil memberikan rekomendasi (diekstrak dengan regex)")
+                            logger.info("Gemini AI berhasil memberikan rekomendasi (diekstrak dengan regex)")
                             return JSONResponse(ai_data)
                         except json.JSONDecodeError as e:
-                            logging.error(f"Gagal parse JSON hasil ekstrak: {e}")
+                            logger.error(f"Gagal parse JSON hasil ekstrak: {e}")
                     else:
-                        logging.error(f"Tidak ditemukan JSON dalam respons: {text[:500]}")
+                        logger.error(f"Tidak ditemukan JSON dalam respons: {text[:500]}")
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
-                logging.error("QUOTA LIMIT atau terlalu banyak request ke Gemini API")
+                logger.error("QUOTA LIMIT atau terlalu banyak request ke Gemini API")
             else:
-                logging.error(f"HTTP error {e.response.status_code} saat memanggil Gemini: {e.response.text}")
+                logger.error(f"HTTP error {e.response.status_code} saat memanggil Gemini: {e.response.text[:200]}")
         except httpx.TimeoutException:
-            logging.error("Timeout saat memanggil Gemini API")
+            logger.error("Timeout saat memanggil Gemini API")
         except Exception as e:
-            logging.error(f"Error tak terduga saat memanggil Gemini: {str(e)}")
+            logger.error(f"Error tak terduga saat memanggil Gemini: {str(e)}")
     
     fallback = get_static_recommendation(skin_type)
-    logging.warning(f"Menggunakan rekomendasi statis untuk skin_type={skin_type}")
+    logger.warning(f"Menggunakan rekomendasi statis untuk skin_type={skin_type}")
     return JSONResponse(fallback)
 
 @app.post("/clear")
@@ -853,17 +881,16 @@ async def generate_pdf(
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.utils import ImageReader
-    from reportlab.lib.colors import HexColor, white, black
+    from reportlab.lib.colors import HexColor, white
     import io
 
-    PINK       = HexColor("#F45D9C")
+    PINK = HexColor("#F45D9C")
     PINK_LIGHT = HexColor("#FFD6EA")
-    PINK_DARK  = HexColor("#C93E7D")
-    ORANGE     = HexColor("#FF9F3D")
-    BG_CREAM   = HexColor("#FFF5F9")
-    GRAY_TEXT  = HexColor("#6B6B80")
-    DARK_TEXT  = HexColor("#2D2D3A")
-    CARD_BG    = HexColor("#FFFFFF")
+    PINK_DARK = HexColor("#C93E7D")
+    BG_CREAM = HexColor("#FFF5F9")
+    GRAY_TEXT = HexColor("#6B6B80")
+    DARK_TEXT = HexColor("#2D2D3A")
+    CARD_BG = HexColor("#FFFFFF")
     PROGRESS_BG = HexColor("#F0EEF5")
 
     pdf_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
@@ -900,11 +927,6 @@ async def generate_pdf(
     c.rect(0, H - 110, W, 110, fill=1, stroke=0)
     c.setFillColor(PINK)
     c.rect(0, H - 110, W * 0.65, 110, fill=1, stroke=0)
-
-    c.setFillColor(HexColor("#FFFFFF20"))
-    c.circle(W - 60, H - 30, 70, fill=1, stroke=0)
-    c.setFillColor(HexColor("#FFFFFF15"))
-    c.circle(W - 20, H - 80, 50, fill=1, stroke=0)
 
     c.setFillColor(white)
     c.setFont("Helvetica-Bold", 26)
@@ -990,13 +1012,13 @@ async def generate_pdf(
     ]
 
     bar_start_y = section_y - 18
-    bar_w_full  = (W - 72)
-    col_w       = bar_w_full / 3
+    bar_w_full = (W - 72)
+    col_w = bar_w_full / 3
     for i, (label, val, hex_color) in enumerate(params):
-        col  = i % 3
-        row  = i // 3
-        bx   = 36 + col * col_w
-        by   = bar_start_y - row * 62
+        col = i % 3
+        row = i // 3
+        bx = 36 + col * col_w
+        by = bar_start_y - row * 62
 
         rounded_rect(bx + 2, by - 36, col_w - 8, 56, 8, fill_color=CARD_BG)
 
@@ -1038,11 +1060,11 @@ async def generate_pdf(
             lines.append(current)
         return lines
 
-    FONT_REC  = "Helvetica"
+    FONT_REC = "Helvetica"
     FONT_SIZE = 9
     BOX_PAD_L = 16
     BOX_PAD_R = 12
-    LINE_H    = 14
+    LINE_H = 14
 
     half_w = (W - 72) / 2 - 6
     inner_w = half_w - BOX_PAD_L - BOX_PAD_R
@@ -1061,8 +1083,8 @@ async def generate_pdf(
         wrapped = wrap_text(line, FONT_REC, FONT_SIZE, inner_w)
         routine_rendered.extend(wrapped)
 
-    max_lines   = max(len(rec_rendered), len(routine_rendered), 5)
-    rec_box_h   = max_lines * LINE_H + 28
+    max_lines = max(len(rec_rendered), len(routine_rendered), 5)
+    rec_box_h = max_lines * LINE_H + 28
 
     rec_y = divider_y - 22
     c.setFillColor(PINK)
@@ -1118,7 +1140,7 @@ async def generate_pdf(
 
     param_labels = ["Moisture", "Sebum", "Acne", "Blackspot", "Wrinkle"]
     param_values = [moisture, oil, acne, blackspot, wrinkle]
-    bar_colors   = ["#36B5FF", "#FF9F3D", "#F45D9C", "#9C6FDB", "#FF6B6B"]
+    bar_colors = ["#36B5FF", "#FF9F3D", "#F45D9C", "#9C6FDB", "#FF6B6B"]
 
     bars = ax.bar(param_labels, param_values, color=bar_colors, width=0.55, zorder=3)
     ax.set_ylim(0, 110)
@@ -1149,8 +1171,8 @@ async def generate_pdf(
     chart_buf.seek(0)
 
     chart_img = ImageReader(chart_buf)
-    chart_w   = W - 72
-    chart_h   = chart_w * 4.2 / 7.5
+    chart_w = W - 72
+    chart_h = chart_w * 4.2 / 7.5
     c.drawImage(chart_img, 36, H - 110 - chart_h, width=chart_w, height=chart_h,
                 preserveAspectRatio=True, mask='auto')
 
@@ -1162,13 +1184,13 @@ async def generate_pdf(
     card_data = [
         ("Moisture", moisture, "#36B5FF",
          "Good" if moisture >= 70 else "Low"),
-        ("Sebum",    oil,      "#FF9F3D",
+        ("Sebum", oil, "#FF9F3D",
          "High" if oil >= 70 else "Normal"),
-        ("Acne",     acne,     "#F45D9C",
+        ("Acne", acne, "#F45D9C",
          "Severe" if acne >= 60 else ("Moderate" if acne >= 30 else "Mild")),
-        ("Blackspot",blackspot,"#9C6FDB",
+        ("Blackspot", blackspot, "#9C6FDB",
          "Visible" if blackspot >= 40 else "Minimal"),
-        ("Wrinkle",  wrinkle,  "#FF6B6B",
+        ("Wrinkle", wrinkle, "#FF6B6B",
          "Prominent" if wrinkle >= 50 else "Subtle"),
     ]
 
@@ -1195,123 +1217,6 @@ async def generate_pdf(
     c.setFont("Helvetica", 8)
     c.drawCentredString(W / 2, 14, "Generated by SkinLens AI  •  For informational purposes only  •  Consult a dermatologist for medical advice")
 
-    # PAGE 3 - Line Graph & Pie Chart
-    c.showPage()
-
-    c.setFillColor(BG_CREAM)
-    c.rect(0, 0, W, H, fill=1, stroke=0)
-
-    c.setFillColor(PINK)
-    c.rect(0, H - 70, W, 70, fill=1, stroke=0)
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(36, H - 42, "Skin Health Overview")
-    c.setFont("Helvetica", 10)
-    c.setFillColor(PINK_LIGHT)
-    c.drawString(36, H - 58, f"{name}  |  {date}  {time}")
-
-    fig_line, ax_line = plt.subplots(figsize=(7.5, 3.5))
-    fig_line.patch.set_facecolor('#FFF5F9')
-    ax_line.set_facecolor('#FFF5F9')
-
-    x_pos = list(range(len(param_labels)))
-    ax_line.plot(x_pos, param_values, color='#F45D9C', linewidth=2.5,
-                 marker='o', markersize=9, markerfacecolor='white',
-                 markeredgecolor='#F45D9C', markeredgewidth=2.5, zorder=3)
-
-    ax_line.fill_between(x_pos, param_values, alpha=0.12, color='#F45D9C')
-
-    for xi, yi in zip(x_pos, param_values):
-        ax_line.annotate(f"{yi}%", (xi, yi),
-                         textcoords="offset points", xytext=(0, 10),
-                         ha='center', fontsize=10, fontweight='bold', color='#2D2D3A')
-
-    ax_line.set_xticks(x_pos)
-    ax_line.set_xticklabels(param_labels, fontsize=10, color='#2D2D3A')
-    ax_line.set_ylim(0, 115)
-    ax_line.set_yticks(range(0, 101, 20))
-    ax_line.yaxis.set_tick_params(labelsize=9, colors='#6B6B80')
-    ax_line.spines['top'].set_visible(False)
-    ax_line.spines['right'].set_visible(False)
-    ax_line.spines['left'].set_color('#F0EEF5')
-    ax_line.spines['bottom'].set_color('#F0EEF5')
-    ax_line.yaxis.grid(True, color='#F0EEF5', linewidth=1.2, zorder=0)
-    ax_line.set_axisbelow(True)
-    ax_line.set_ylabel("Score (%)", fontsize=9, color='#6B6B80')
-    ax_line.set_title(f"Skin Parameter Trend — {skin_type} ({confidence}% confidence)",
-                      fontsize=12, color='#F45D9C', fontweight='bold', pad=12)
-    plt.tight_layout(pad=1.5)
-
-    line_buf = io.BytesIO()
-    plt.savefig(line_buf, format='png', dpi=130, bbox_inches='tight',
-                facecolor='#FFF5F9', edgecolor='none')
-    plt.close()
-    line_buf.seek(0)
-
-    line_img = ImageReader(line_buf)
-    line_w = W - 72
-    line_h = line_w * 3.5 / 7.5
-    line_y = H - 90 - line_h
-    c.drawImage(line_img, 36, line_y, width=line_w, height=line_h,
-                preserveAspectRatio=True, mask='auto')
-
-    c.setFillColor(PINK)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(36, line_y - 22, "Line Graph — Skin Parameter Trend")
-
-    fig_pie, ax_pie = plt.subplots(figsize=(6, 4))
-    fig_pie.patch.set_facecolor('#FFF5F9')
-    ax_pie.set_facecolor('#FFF5F9')
-
-    max_idx = param_values.index(max(param_values))
-    explode = [0.05 if i == max_idx else 0 for i in range(len(param_values))]
-
-    wedges, texts, autotexts = ax_pie.pie(
-        param_values,
-        labels=param_labels,
-        colors=bar_colors,
-        autopct='%1.1f%%',
-        startangle=140,
-        explode=explode,
-        pctdistance=0.78,
-        wedgeprops=dict(linewidth=1.5, edgecolor='white')
-    )
-    for text in texts:
-        text.set_fontsize(10)
-        text.set_color('#2D2D3A')
-        text.set_fontweight('bold')
-    for autotext in autotexts:
-        autotext.set_fontsize(9)
-        autotext.set_color('white')
-        autotext.set_fontweight('bold')
-
-    ax_pie.set_title(f"Skin Parameter Distribution — {skin_type}",
-                     fontsize=12, color='#F45D9C', fontweight='bold', pad=14)
-    plt.tight_layout(pad=1.5)
-
-    pie_buf = io.BytesIO()
-    plt.savefig(pie_buf, format='png', dpi=130, bbox_inches='tight',
-                facecolor='#FFF5F9', edgecolor='none')
-    plt.close()
-    pie_buf.seek(0)
-
-    pie_img  = ImageReader(pie_buf)
-    pie_w    = W - 72
-    pie_h    = pie_w * 4.0 / 6.0
-    pie_y    = line_y - 40 - pie_h
-    c.drawImage(pie_img, 36, pie_y, width=pie_w, height=pie_h,
-                preserveAspectRatio=True, mask='auto')
-
-    c.setFillColor(PINK)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(36, pie_y - 20, "Pie Chart — Parameter Composition")
-
-    c.setFillColor(PINK)
-    c.rect(0, 0, W, 38, fill=1, stroke=0)
-    c.setFillColor(white)
-    c.setFont("Helvetica", 8)
-    c.drawCentredString(W / 2, 14, "Generated by SkinLens AI  •  For informational purposes only  •  Consult a dermatologist for medical advice")
-
     c.save()
 
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"skin_report_{name or 'user'}.pdf")
@@ -1319,7 +1224,12 @@ async def generate_pdf(
 @app.get("/health")
 async def health_check():
     """Health check endpoint untuk Railway"""
-    return {"status": "healthy", "model_loaded": os.path.exists("skin_model.h5")}
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "face_detector_loaded": face_detector is not None,
+        "opencv_loaded": True
+    }
 
 if __name__ == "__main__":
     import uvicorn
