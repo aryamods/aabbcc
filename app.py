@@ -5,23 +5,42 @@ import random
 import tempfile
 import asyncio
 import re
-import cv2
+import sys
+
+# IMPORTANT: Set headless mode BEFORE importing OpenCV
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+os.environ['DISPLAY'] = ':0'
+
+# Suppress oneDNN warnings
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# Now import libraries safely
 import numpy as np
 import tensorflow as tf
+
+# Load OpenCV with headless configuration
+try:
+    import cv2
+    # Test if cv2 works properly
+    cv2.setNumThreads(0)  # Disable threading for headless
+except ImportError as e:
+    logging.error(f"Failed to import cv2: {e}")
+    logging.error("Make sure opencv-python-headless is installed")
+    sys.exit(1)
+
 import mediapipe as mp
 import httpx
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for headless
 import matplotlib.pyplot as plt
 from json_repair import repair_json
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
-
-# Suppress oneDNN warnings
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 app = FastAPI()
 
@@ -96,12 +115,16 @@ else:
 
 # Load face detector dari MediaPipe
 try:
-    face_detector = mp.tasks.vision.FaceDetector.create_from_options(
-        mp.tasks.vision.FaceDetectorOptions(
-            base_options=mp.tasks.BaseOptions(model_asset_path="face_detection_short_range.tflite"),
-            min_detection_confidence=0.75
-        )
+    # MediaPipe options for headless environment
+    base_options = mp.tasks.BaseOptions(
+        model_asset_path="face_detection_short_range.tflite"
     )
+    options = mp.tasks.vision.FaceDetectorOptions(
+        base_options=base_options,
+        min_detection_confidence=0.75,
+        running_mode=mp.tasks.vision.RunningMode.IMAGE
+    )
+    face_detector = mp.tasks.vision.FaceDetector.create_from_options(options)
 except Exception as e:
     logging.error(f"Failed to load face detector: {e}")
     face_detector = None
@@ -131,88 +154,92 @@ def get_static_recommendation(skin_type):
 
 def process_frame(frame_bytes):
     """Deteksi wajah, klasifikasi jenis kulit, dan hitung parameter kulit."""
-    np_arr = np.frombuffer(frame_bytes, np.uint8)
-    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    if frame is None:
-        return None
+    try:
+        np_arr = np.frombuffer(frame_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    
-    if face_detector is None:
-        return None
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         
-    results = face_detector.detect(mp_image)
+        if face_detector is None:
+            return None
+            
+        results = face_detector.detect(mp_image)
 
-    h, w, _ = frame.shape
-    detection_data = None
+        h, w, _ = frame.shape
+        detection_data = None
 
-    if results.detections:
-        for detection in results.detections:
-            bbox = detection.bounding_box
-            x = int(bbox.origin_x)
-            y = int(bbox.origin_y)
-            bw = int(bbox.width)
-            bh = int(bbox.height)
+        if results.detections:
+            for detection in results.detections:
+                bbox = detection.bounding_box
+                x = int(bbox.origin_x)
+                y = int(bbox.origin_y)
+                bw = int(bbox.width)
+                bh = int(bbox.height)
 
-            margin_x = int(bw * 0.10)
-            margin_y = int(bh * 0.15)
-            x1 = max(0, x - margin_x)
-            y1 = max(0, y - margin_y)
-            x2 = min(w, x + bw + margin_x)
-            y2 = min(h, y + bh + margin_y)
+                margin_x = int(bw * 0.10)
+                margin_y = int(bh * 0.15)
+                x1 = max(0, x - margin_x)
+                y1 = max(0, y - margin_y)
+                x2 = min(w, x + bw + margin_x)
+                y2 = min(h, y + bh + margin_y)
 
-            face = frame[y1:y2, x1:x2]
-            if face.size == 0:
-                continue
+                face = frame[y1:y2, x1:x2]
+                if face.size == 0:
+                    continue
 
-            # Preprocessing untuk model klasifikasi
-            img = cv2.resize(face, (224, 224))
-            img = img.astype(np.float32) / 255.0
-            img = np.expand_dims(img, axis=0)
+                # Preprocessing untuk model klasifikasi
+                img = cv2.resize(face, (224, 224))
+                img = img.astype(np.float32) / 255.0
+                img = np.expand_dims(img, axis=0)
 
-            pred = model.predict(img, verbose=0)
-            class_id = np.argmax(pred)
-            confidence = int(np.max(pred) * 100)
-            skin_type = labels[class_id]
+                pred = model.predict(img, verbose=0)
+                class_id = np.argmax(pred)
+                confidence = int(np.max(pred) * 100)
+                skin_type = labels[class_id]
 
-            # Simulasi skor parameter kulit (untuk demo)
-            moisture = random.randint(60, 95)
-            oil = random.randint(35, 90)
-            acne = random.randint(5, 80)
-            blackspot = random.randint(5, 70)
-            wrinkle = random.randint(5, 60)
+                # Simulasi skor parameter kulit (untuk demo)
+                moisture = random.randint(60, 95)
+                oil = random.randint(35, 90)
+                acne = random.randint(5, 80)
+                blackspot = random.randint(5, 70)
+                wrinkle = random.randint(5, 60)
 
-            now = datetime.now()
-            current_date = now.strftime("%d-%m-%Y")
-            current_time = now.strftime("%H:%M:%S")
+                now = datetime.now()
+                current_date = now.strftime("%d-%m-%Y")
+                current_time = now.strftime("%H:%M:%S")
 
-            # Warna bounding box berdasarkan jenis kulit
-            if skin_type == "Acne":
-                box_color = "#FF0000"
-            elif skin_type == "Oily":
-                box_color = "#FFFF00"
-            elif skin_type == "Dry":
-                box_color = "#FF7800"
-            else:
-                box_color = "#00FF00"
+                # Warna bounding box berdasarkan jenis kulit
+                if skin_type == "Acne":
+                    box_color = "#FF0000"
+                elif skin_type == "Oily":
+                    box_color = "#FFFF00"
+                elif skin_type == "Dry":
+                    box_color = "#FF7800"
+                else:
+                    box_color = "#00FF00"
 
-            detection_data = {
-                "skin_type": skin_type,
-                "confidence": confidence,
-                "moisture": moisture,
-                "oil": oil,
-                "acne": acne,
-                "blackspot": blackspot,
-                "wrinkle": wrinkle,
-                "date": current_date,
-                "time": current_time,
-                "box": [x1, y1, x2, y2],
-                "box_color": box_color
-            }
-            break
+                detection_data = {
+                    "skin_type": skin_type,
+                    "confidence": confidence,
+                    "moisture": moisture,
+                    "oil": oil,
+                    "acne": acne,
+                    "blackspot": blackspot,
+                    "wrinkle": wrinkle,
+                    "date": current_date,
+                    "time": current_time,
+                    "box": [x1, y1, x2, y2],
+                    "box_color": box_color
+                }
+                break
 
-    return detection_data, frame.shape[:2] if detection_data else None
+        return detection_data, frame.shape[:2] if detection_data else None
+    except Exception as e:
+        logging.error(f"Error processing frame: {e}")
+        return None
 
 # ---------- API Endpoints ----------
 @app.get("/", response_class=HTMLResponse)
@@ -558,7 +585,8 @@ async def get_index():
             canvas.style.display = "block";
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             
-            const wsUrl = `ws://${window.location.host}/ws`;
+            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
             ws = new WebSocket(wsUrl);
             ws.onmessage = handleWebSocketMessage;
             ws.onopen = () => {
